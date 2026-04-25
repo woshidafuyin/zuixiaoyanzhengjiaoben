@@ -266,7 +266,8 @@ def recv_uds_payload(timeout: float = 5.0):
 
         print(f"[ISO-TP RX] FF total_len={total_len}, already={len(buf)}")
 
-        fc = b"\x30\x00\x00\x00\x00\x00\x00\x00"
+        fc = b"\x30\x00\x00\xAA\xAA\xAA\xAA\xAA"
+
         print("[FC] send:", hx(fc))
         send(PHY_ID, fc)
 
@@ -436,6 +437,7 @@ def keygen(seed: bytes) -> bytes:
         raise RuntimeError("KEY_HEX is empty")
 
     return key
+
 def run():
     global BUS
 
@@ -451,8 +453,12 @@ def run():
     )
 
     try:
+        ka.start()
+        time.sleep(PRE_WAKEUP_TIME)
+
         print("==== START CAPL DRIVER DOWNLOAD MIN ====")
         print("BUS_KWARGS =", BUS_KWARGS)
+
 
         time.sleep(0.2)
         drain_bus(0.5)
@@ -632,33 +638,84 @@ def run():
         seq = 1
 
         while pos < len(app_data):
-            print(f"[36 APP] block={seq}/{total_blocks_app} pos={pos}")
+            if seq == 1 or seq == total_blocks_app or seq % 50 == 0:
+                print(f"[36 APP] block={seq}/{total_blocks_app} pos={pos}")
 
             chunk = app_data[pos:pos + chunk_size_app]
 
             req = bytes([0x36, seq & 0xFF]) + chunk
 
-            print(f"[36 APP TX] seq=0x{seq & 0xFF:02X} pos={pos} chunk_len={len(chunk)}")
-            # print("chunk head =", hx(chunk[:16]))
-            # print("chunk tail =", hx(chunk[-16:]))
-
             send_uds(req)
 
             try:
-                resp36 = wait_sid(sid=0x36, timeout=5.0)
-                print(f"[OK] 36 APP seq=0x{seq & 0xFF:02X} resp={hx(resp36)}")
+                resp36 = wait_sid(sid=0x36, timeout=10)
+                if seq == 1 or seq == total_blocks_app or seq % 50 == 0:
+                    print(f"[OK] 36 APP seq=0x{seq & 0xFF:02X} resp={hx(resp36)}")
             except Exception as e:
                 print(f"[FAIL] 36 APP seq=0x{seq & 0xFF:02X} pos={pos} chunk_len={len(chunk)}")
+
+                print(f"[FAIL] req_len={len(req)} seq=0x{seq & 0xFF:02X} pos={pos}")
+                print("fail req head =", hx(req[:32]))
+
                 print("fail chunk head =", hx(chunk[:32]))
                 print("fail chunk tail =", hx(chunk[-32:]))
-                raise
 
-            time.sleep(0.05)
+                raise
+            time.sleep(0.08)
             pos += len(chunk)
             seq = (seq + 1) & 0xFF
 
         print("==== APP 36 DONE ====")
-        print("==== DRIVER + FF00 + APP34 + APP36 DONE ====")
+        # ===== 18. APP DD02 =====
+        print("==== APP DD02 ====")
+        app_sig = parse_rsa_text(RSA_APP)
+        print("app sig len =", len(app_sig))
+        print("app sig head =", hx(app_sig[:16]))
+        print("app sig tail =", hx(app_sig[-16:]))
+
+        assert len(app_sig) == 512, f"APP RSA len error: {len(app_sig)}"
+
+        payload_app_dd02 = b"\x31\x01\xDD\x02" + app_sig
+        print("APP DD02 payload len =", len(payload_app_dd02))
+
+        send_uds(payload_app_dd02)
+        resp_app_dd02 = wait_sid(0x31, timeout=10.0)
+        print("[OK] APP 31 DD02 =", hx(resp_app_dd02))
+
+        time.sleep(1.0)
+
+        # ===== 20. 31 FF01 checkProgrammingDependencies =====
+        print("==== 31 FF01 CHECK PROGRAMMING DEPENDENCIES ====")
+
+        send_uds(b"\x31\x01\xFF\x01")
+        resp_ff01 = wait_sid(0x31, timeout=10.0)
+        print("[OK] 31 FF01 =", hx(resp_ff01))
+
+        time.sleep(1.0)
+
+        # ===== 21. ECU RESET =====
+        print("==== ECU RESET 11 01 ====")
+
+        send(PHY_ID, b"\x02\x11\x01\x55\x55\x55\x55\x55")
+        resp11 = wait_sid(0x11, timeout=5.0)
+        print("[OK] 11 01 =", hx(resp11))
+
+        time.sleep(7.0)
+
+        # ===== 22. ENTER DEFAULT SESSION 10 81 =====
+        print("==== ENTER DEFAULT SESSION 10 81 ====")
+
+        send(FUN_ID, b"\x02\x10\x81\x55\x55\x55\x55\x55")
+        time.sleep(0.5)
+
+        # ===== 23. CLEAR DTC 14 =====
+        print("==== CLEAR DTC 14 ====")
+
+        send(FUN_ID, b"\x04\x14\xFF\xFF\xFF\x55\x55\x55")
+        time.sleep(10.0)
+
+        print("==== CAPL DOWNLOAD MIN DONE ====")
+
 
     finally:
         try:
