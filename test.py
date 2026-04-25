@@ -56,8 +56,8 @@ PY32 = r"E:\upPC\yanzhengjiaoben\venv32\Scripts\python.exe"
 KEYGEN = r"E:\upPC\yanzhengjiaoben\keygen_worker_auto.py"
 DLL = r"E:\upPC\devtools\shuaxiewenjian\CHERY_E0Y_UPDATE23231115.dll"
 
-S19_DRIVER = r"E:\qirui\FlashChery_KP31_V1.0_20260407(2)\shuaxiewenjian\ARS1.33_702000139AA_S0000054429_FLD_020001.s19"
-RSA_DRIVER = r"E:\qirui\FlashChery_KP31_V1.0_20260407(2)\shuaxiewenjian\CIR_S0000054429_020001_FLD1_MCU_UDS_20260417.rsa"
+S19_DRIVER = r"E:\upPC\devtools\shuaxiewenjian\ARS1.33_702000139AA_S0000054429_FLD_020001.s19"
+RSA_DRIVER = r"E:\upPC\devtools\shuaxiewenjian\CIR_S0000054429_020001_FLD1_MCU_UDS_20260417.rsa"
 
 
 # =========================
@@ -182,33 +182,58 @@ def wait_sid(sid: int, timeout: float = 5.0):
 def send_uds(payload: bytes, functional: bool = False, pad: int = PAD):
     tx_id = FUN_ID if functional else PHY_ID
 
+    # ===== 单帧 =====
     if len(payload) <= 7:
         frame = bytes([len(payload)]) + payload
         frame += bytes([pad]) * (8 - len(frame))
         send(tx_id, frame)
         return
 
+    # ===== 多帧 =====
     length = len(payload)
     if length > 0xFFF:
         raise ValueError(f"payload too large for classic ISO-TP: {length}")
 
-    ff = bytes([0x10 | ((length >> 8) & 0x0F), length & 0xFF]) + payload[:6]
+    # ---------- First Frame ----------
+    ff = bytes([
+        0x10 | ((length >> 8) & 0x0F),
+        length & 0xFF
+    ]) + payload[:6]
+
     ff += bytes([pad]) * (8 - len(ff))
     send(tx_id, ff)
 
-    fc = recv(timeout=1.5)
+    # ---------- 等 FlowControl（🔥关键修复） ----------
+    fc = None
+    t_end = time.time() + 2.0
+
+    while time.time() < t_end:
+        msg = recv(timeout=0.1)
+        if msg is None:
+            continue
+
+        print("[RX for FC]", hx(msg))   # 🔥调试用
+
+        # 只认 FC（0x30）
+        if msg[0] == 0x30:
+            fc = msg
+            break
+
     if fc is None:
         raise TimeoutError("No FlowControl after FF")
-    if fc[0] != 0x30:
-        raise RuntimeError(f"Expected FC 30, got {hx(fc)}")
 
+    print("[FC OK]", hx(fc))
+
+    # ---------- Consecutive Frames ----------
     pos = 6
     sn = 1
 
     while pos < length:
         chunk = payload[pos:pos + 7]
+
         frame = bytes([0x20 | (sn & 0x0F)]) + chunk
         frame += bytes([pad]) * (8 - len(frame))
+
         send(tx_id, frame)
 
         pos += len(chunk)
@@ -311,14 +336,14 @@ def parse_rsa_text(path: str) -> bytes:
                     buff += ch
 
                 if len(buff) == 4:
-                    val = int(buff)   # CAPL atol
+                    val = int(buff, 16)
                     out.append(val & 0xFF)
                     buff = ""
 
-    if len(out) < 128:
-        raise RuntimeError(f"RSA parsed too short: {len(out)} bytes, need 128")
+    if len(out) < 512:
+        raise RuntimeError(f"RSA parsed too short: {len(out)} bytes, need 512")
 
-    return bytes(out[:128])
+    return bytes(out[:512])
 
 
 def keygen(seed: bytes) -> bytes:
@@ -345,17 +370,12 @@ def keygen(seed: bytes) -> bytes:
         raise RuntimeError("KEY_HEX is empty")
 
     return key
-
-# =========================
-# 主流程
-# =========================
 def run():
-    global BUS   # 🔥必须第一行
+    global BUS
 
     BUS = can.Bus(**BUS_KWARGS)
     print("[OK] bus opened")
 
-    # 👉 创建线程（此时 BUS 已经有效）
     ka = PeriodicSender(
         bus=BUS,
         arb_id=KEEP_ALIVE_ID,
@@ -368,11 +388,7 @@ def run():
         print("==== START CAPL DRIVER DOWNLOAD MIN ====")
         print("BUS_KWARGS =", BUS_KWARGS)
 
-        # ❗先不要启动线程，先验证主链路
-        # ka.start()
         time.sleep(0.2)
-
-        # 清总线残留
         drain_bus(0.5)
 
         # ===== 1. 10 83 =====
@@ -380,28 +396,24 @@ def run():
 
         # ===== 2. 3E 80 =====
         send(FUN_ID, b"\x02\x3E\x80\x55\x55\x55\x55\x55")
-
         time.sleep(0.1)
 
         # ===== 3. 31 0203 =====
         send(PHY_ID, b"\x04\x31\x01\x02\x03\x55\x55\x55")
         resp31 = wait_sid(0x31, timeout=2.0)
         print("[OK] 31 0203 =", hx(resp31))
-
         time.sleep(0.1)
 
         # ===== 4. 10 02 =====
         send(PHY_ID, b"\x02\x10\x02\x55\x55\x55\x55\x55")
         resp10 = wait_sid(0x10, timeout=6.0)
         print("[OK] 10 02 =", hx(resp10))
-
         time.sleep(2.2)
 
         # ===== 5. 27 11 =====
         send(PHY_ID, b"\x02\x27\x11\xFF\xFF\xFF\xFF\xFF")
 
         seed_resp = recv_uds_payload(timeout=5.0)
-
         if seed_resp is None or len(seed_resp) < 6:
             print("[WARN] incomplete seed response:", seed_resp)
             return
@@ -412,8 +424,6 @@ def run():
             raise RuntimeError(f"Unexpected 27 seed response: {hx(seed_resp)}")
 
         seed = seed_resp[2:]
-
-        # 🔥关键防御
         if len(seed) > 16:
             seed = seed[:16]
 
@@ -425,17 +435,16 @@ def run():
 
         # ===== 7. 27 12 =====
         send_uds(b"\x27\x12" + key)
+
         resp27 = wait_sid(0x27, timeout=2.0)
         print("[OK] 27 12 =", hx(resp27))
-
         time.sleep(0.1)
 
         # ===== 8. 2E F184 =====
-        finger = b"\x26\x04\x23" + b"\xFF" * 17
+        finger = b"\x26\x04\x23" + b"\xFF" * 16
         send_uds(b"\x2E\xF1\x84" + finger)
         resp2e = wait_sid(0x2E, timeout=2.0)
         print("[OK] 2E F184 =", hx(resp2e))
-
         time.sleep(0.1)
 
         # ===== 9. Driver =====
@@ -450,12 +459,19 @@ def run():
 
         block_length = (resp34[5] << 8) | resp34[6]
         chunk_size = block_length - 2
+        print("chunk_size =", chunk_size)
 
         # ===== 11. 36 =====
+        total_blocks = (len(driver_data) + chunk_size - 1) // chunk_size
+
         pos = 0
         seq = 1
 
+        print(">>> WAITING 36 FINISH <<<")
+
         while pos < len(driver_data):
+            print(f"[36] block={seq}/{total_blocks}")
+
             chunk = driver_data[pos:pos + chunk_size]
             send_uds(bytes([0x36, seq & 0xFF]) + chunk)
             wait_sid(0x36, timeout=3.0)
@@ -463,16 +479,27 @@ def run():
             pos += len(chunk)
             seq = (seq + 1) & 0xFF
 
+        print("36 DONE")
+
         # ===== 12. 37 =====
-        send(PHY_ID, b"\x01\x37\x55\x55\x55\x55\x55\x55")
+        send_uds(b"\x37")
         resp37 = wait_sid(0x37, timeout=2.0)
         print("[OK] 37 =", hx(resp37))
 
         time.sleep(1.0)
 
-        # ===== 13. DD02 =====
+        # ===== 13. 31 DD02 =====
         sig = parse_rsa_text(RSA_DRIVER)
-        send_uds(b"\x31\x01\xDD\x02" + sig)
+
+        print("sig len =", len(sig))
+        print("sig =", hx(sig))  # 👈 必须有！！！
+
+        assert len(sig) == 512, f"RSA len error: {len(sig)}"
+        payload = b"\x31\x01\xDD\x02" + sig
+        print("payload len =", len(payload))
+
+        send_uds(payload)
+
         resp_dd02 = wait_sid(0x31, timeout=5.0)
         print("[OK] 31 DD02 =", hx(resp_dd02))
 
@@ -487,7 +514,6 @@ def run():
         if BUS is not None:
             BUS.shutdown()
             print("[OK] bus closed")
-
 
 if __name__ == "__main__":
     run()
