@@ -36,7 +36,8 @@ BUS_KWARGS = {
 
 BUS = None
 
-
+APP_START = 0x000C1000
+APP_LEN   = 0x0013BFFF
 FUN_ID = 0x7DF
 PHY_ID = 0x71F
 RES_ID = 0x79F
@@ -58,7 +59,8 @@ DLL = r"E:\upPC\devtools\shuaxiewenjian\CHERY_E0Y_UPDATE23231115.dll"
 
 S19_DRIVER = r"E:\upPC\devtools\shuaxiewenjian\ARS1.33_702000139AA_S0000054429_FLD_020001.s19"
 RSA_DRIVER = r"E:\upPC\devtools\shuaxiewenjian\CIR_S0000054429_020001_FLD1_MCU_UDS_20260417.rsa"
-
+S19_APP = r"E:\upPC\devtools\shuaxiewenjian\awr6432(2).s19"
+RSA_APP = r"E:\upPC\devtools\shuaxiewenjian\CIR_S0000054430_020001_ASW1_MCU_UDS_20260421.rsa"
 
 # =========================
 # Driver 地址：来自 CANoe 面板
@@ -118,8 +120,17 @@ def send(arbid: int, data: bytes):
         bitrate_switch=False,
     )
     BUS.send(msg)
-    print(f"[TX] 0x{arbid:03X}: {hx(data)}")
 
+    pci = data[0] >> 4
+    sid = data[1] if len(data) > 1 else None
+
+    # 屏蔽：
+    # 1. 36 请求（首帧/单帧）
+    # 2. 所有 CF 连续帧（PCI=0x2）
+    if sid == 0x36 or pci == 0x2:
+        return
+
+    print(f"[TX] 0x{arbid:03X}: {hx(data)}")
 
 def recv(timeout: float = 2.0):
     end = time.time() + timeout
@@ -290,27 +301,97 @@ def recv_uds_payload(timeout: float = 5.0):
 # 文件解析
 # =========================
 def s19_to_bin(path: str, start: int, length: int) -> bytes:
-    mem = {}
+    """
+    CAPL FileInit() 同款 S19 解析逻辑：
+    - 支持 S1/S2/S3
+    - 校验 checksum
+    - 先按 length 建完整 buffer，默认 0xFF
+    - 只把落在 [start, start+length) 范围内的数据覆盖进去
+    - 返回长度固定为 length 的 bytes
+    """
+
+    buf = bytearray([0xFF] * length)
+    loaded_bytes = 0
+    valid_records = 0
+
+    def hex_byte(s: str) -> int:
+        return int(s, 16)
 
     with open(path, "r", encoding="ascii", errors="ignore") as f:
-        for line in f:
+        for line_no, line in enumerate(f, 1):
             line = line.strip()
-            if not line.startswith("S3"):
+
+            if len(line) < 10:
                 continue
 
-            count = int(line[2:4], 16)
-            addr = int(line[4:12], 16)
-            data_hex = line[12:12 + (count - 5) * 2]
-            raw = bytes.fromhex(data_hex)
+            if not line.startswith("S"):
+                continue
 
-            for i, b in enumerate(raw):
-                mem[addr + i] = b
+            rec_type = line[1]
 
-    if not mem:
-        raise RuntimeError(f"No S3 records found: {path}")
+            if rec_type not in ("1", "2", "3"):
+                continue
 
-    return bytes(mem.get(a, 0xFF) for a in range(start, start + length))
+            count = hex_byte(line[2:4])
 
+            if rec_type == "1":
+                addr_len = 2
+            elif rec_type == "2":
+                addr_len = 3
+            else:
+                addr_len = 4
+
+            addr_hex_start = 4
+            addr_hex_end = addr_hex_start + addr_len * 2
+            addr = int(line[addr_hex_start:addr_hex_end], 16)
+
+            data_len = count - addr_len - 1
+            data_hex_start = addr_hex_end
+            data_hex_end = data_hex_start + data_len * 2
+            checksum_hex_start = data_hex_end
+            checksum_hex_end = checksum_hex_start + 2
+
+            if len(line) < checksum_hex_end:
+                raise RuntimeError(f"S19 line too short at line {line_no}: {line}")
+
+            data_hex = line[data_hex_start:data_hex_end]
+            checksum = hex_byte(line[checksum_hex_start:checksum_hex_end])
+
+            # CAPL FileCheckSum 等价：所有 count 后面的字节求和，再加 checksum 应该等于 0xFF
+            raw_for_sum = bytes.fromhex(line[2:checksum_hex_start])
+            if ((sum(raw_for_sum) + checksum) & 0xFF) != 0xFF:
+                raise RuntimeError(f"S19 checksum error at line {line_no}: {line}")
+
+            data = bytes.fromhex(data_hex)
+            valid_records += 1
+
+            # CAPL: if address < flshAppStartAddr，则跳过该行
+            if addr < start:
+                continue
+
+            for i, b in enumerate(data):
+                byte_addr = addr + i
+
+                if start <= byte_addr < start + length:
+                    buf[byte_addr - start] = b
+                    loaded_bytes += 1
+
+    if valid_records == 0:
+        raise RuntimeError(f"No S1/S2/S3 records found: {path}")
+
+    if loaded_bytes == 0:
+        raise RuntimeError(
+            f"No S19 data loaded into range: "
+            f"start=0x{start:08X}, length=0x{length:08X}, file={path}"
+        )
+
+    print(f"[S19] file={path}")
+    print(f"[S19] start=0x{start:08X} length=0x{length:08X}")
+    print(f"[S19] valid_records={valid_records} loaded_bytes={loaded_bytes}")
+    print("[S19] head =", hx(bytes(buf[:32])))
+    print("[S19] @0x7B pos =", hx(bytes(buf[387072:387072 + 32])))
+
+    return bytes(buf)
 def parse_rsa_text(path: str) -> bytes:
     import re
 
@@ -378,17 +459,17 @@ def run():
 
         # ===== 1. 10 83 =====
         send(FUN_ID, b"\x02\x10\x83\x55\x55\x55\x55\x55")
+        time.sleep(0.05)
 
         # ===== 2. 3E 80 =====
         send(FUN_ID, b"\x02\x3E\x80\x55\x55\x55\x55\x55")
-        time.sleep(0.1)
+        time.sleep(0.05)
 
         # ===== 3. 31 0203 =====
         send(PHY_ID, b"\x04\x31\x01\x02\x03\x55\x55\x55")
-        resp31 = wait_sid(0x31, timeout=2.0)
+        resp31 = wait_sid(0x31, timeout=5.0)
         print("[OK] 31 0203 =", hx(resp31))
         time.sleep(0.1)
-
         # ===== 4. 10 02 =====
         send(PHY_ID, b"\x02\x10\x02\x55\x55\x55\x55\x55")
         resp10 = wait_sid(0x10, timeout=6.0)
@@ -501,8 +582,83 @@ def run():
 
         resp_dd02 = wait_sid(0x31, timeout=5.0)
         print("[OK] 31 DD02 =", hx(resp_dd02))
+        print("==== DRIVER DD02 DONE ====")
 
-        print("==== DRIVER DONE ====")
+        time.sleep(1.0)
+
+        # ===== 14. 31 FF00 erase memory =====
+        print("==== 31 FF00 ERASE ====")
+        payload_ff00 = (
+                b"\x31\x01\xFF\x00"
+                + b"\x44"
+                + APP_START.to_bytes(4, "big")
+                + APP_LEN.to_bytes(4, "big")
+        )
+
+        send_uds(payload_ff00)
+        resp_ff00 = wait_sid(0x31, timeout=5.0)
+        print("[OK] 31 FF00 =", hx(resp_ff00))
+
+        time.sleep(0.05)
+
+        # ===== 15. APP 34 =====
+        print("==== APP 34 ====")
+        req34_app = struct.pack(">BBBII", 0x34, 0x00, 0x44, APP_START, APP_LEN)
+        send_uds(req34_app)
+        resp34_app = wait_sid(0x34, timeout=5.0)
+        print("[OK] 34 APP =", hx(resp34_app))
+
+        print("==== STAGE APP 34 DONE ====")
+        # ===== 16. LOAD APP S19 =====
+        print("==== LOAD APP S19 ====")
+        app_data = s19_to_bin(S19_APP, APP_START, APP_LEN)
+        print("app head =", hx(app_data[:32]))
+        print("app tail =", hx(app_data[-32:]))
+        print(f"[APP] start=0x{APP_START:08X} len=0x{APP_LEN:08X}")
+        print("app_data len =", len(app_data))
+
+        # ===== 17. APP 36 =====
+        print("==== APP 36 START ====")
+
+        block_length_app = (resp34_app[5] << 8) | resp34_app[6]
+        chunk_size_app = block_length_app - 2
+
+        print("app block_length =", block_length_app)
+        print("app chunk_size =", chunk_size_app)
+
+        total_blocks_app = (len(app_data) + chunk_size_app - 1) // chunk_size_app
+
+        pos = 0
+        seq = 1
+
+        while pos < len(app_data):
+            print(f"[36 APP] block={seq}/{total_blocks_app} pos={pos}")
+
+            chunk = app_data[pos:pos + chunk_size_app]
+
+            req = bytes([0x36, seq & 0xFF]) + chunk
+
+            print(f"[36 APP TX] seq=0x{seq & 0xFF:02X} pos={pos} chunk_len={len(chunk)}")
+            # print("chunk head =", hx(chunk[:16]))
+            # print("chunk tail =", hx(chunk[-16:]))
+
+            send_uds(req)
+
+            try:
+                resp36 = wait_sid(sid=0x36, timeout=5.0)
+                print(f"[OK] 36 APP seq=0x{seq & 0xFF:02X} resp={hx(resp36)}")
+            except Exception as e:
+                print(f"[FAIL] 36 APP seq=0x{seq & 0xFF:02X} pos={pos} chunk_len={len(chunk)}")
+                print("fail chunk head =", hx(chunk[:32]))
+                print("fail chunk tail =", hx(chunk[-32:]))
+                raise
+
+            time.sleep(0.05)
+            pos += len(chunk)
+            seq = (seq + 1) & 0xFF
+
+        print("==== APP 36 DONE ====")
+        print("==== DRIVER + FF00 + APP34 + APP36 DONE ====")
 
     finally:
         try:
