@@ -11,7 +11,7 @@ CAPL Download 最小复刻脚本（Driver阶段）
 6. 27 11 / 27 12
 7. 2E F184
 8. Driver 34 / 36 / 37
-9. Driver DD02，按 CAPL driverData() 逻辑解析 .rsa 文本为 128 字节
+9. Driver DD02，按 CAPL driverData() 逻辑解析 .rsa 文本为 512 字节
 
 当前还不是完整 App 全流程：
 未包含 31 FF00、App 34/36/37、App DD02、31 FF01、11 reset、10 81、14 清DTC。
@@ -311,40 +311,25 @@ def s19_to_bin(path: str, start: int, length: int) -> bytes:
 
     return bytes(mem.get(a, 0xFF) for a in range(start, start + length))
 
-
 def parse_rsa_text(path: str) -> bytes:
-    """
-    复刻 CAPL driverData():
-
-    - 逐字符读取 rsa 文本
-    - 空格跳过
-    - 逗号跳过
-    - 每 4 个字符组成一个字符串
-    - CAPL 用 atol(Buff2)
-    - 写入 Signature.Data_128[k++]
-    """
-    out = []
-    buff = ""
+    import re
 
     with open(path, "r", encoding="ascii", errors="ignore") as f:
-        for line in f:
-            for ch in line:
-                if ch == " ":
-                    continue
+        text = f.read()
 
-                if ch != ",":
-                    buff += ch
+    # 支持 0x / 0X
+    tokens = re.findall(r"0[xX]([0-9a-fA-F]{1,2})", text)
 
-                if len(buff) == 4:
-                    val = int(buff, 16)
-                    out.append(val & 0xFF)
-                    buff = ""
+    if len(tokens) < 512:
+        raise RuntimeError(f"RSA parsed too short: {len(tokens)} bytes, need 512")
 
-    if len(out) < 512:
-        raise RuntimeError(f"RSA parsed too short: {len(out)} bytes, need 512")
+    data = bytes(int(x, 16) & 0xFF for x in tokens[:512])
 
-    return bytes(out[:512])
+    # 🔥 强校验（关键）
+    print("sig len =", len(data))
+    print("sig head =", " ".join(f"{b:02X}" for b in data[:16]))
 
+    return data
 
 def keygen(seed: bytes) -> bytes:
     try:
@@ -475,6 +460,7 @@ def run():
             chunk = driver_data[pos:pos + chunk_size]
             send_uds(bytes([0x36, seq & 0xFF]) + chunk)
             wait_sid(0x36, timeout=3.0)
+            time.sleep(0.05)
 
             pos += len(chunk)
             seq = (seq + 1) & 0xFF
@@ -482,20 +468,33 @@ def run():
         print("36 DONE")
 
         # ===== 12. 37 =====
+        # ===== 12. 37 =====
         send_uds(b"\x37")
         resp37 = wait_sid(0x37, timeout=2.0)
         print("[OK] 37 =", hx(resp37))
 
+        # CAPL: server_37 后 TxMsgSrever 内部 50ms
+        time.sleep(0.05)
+
+        # CAPL: 37 后周期 3E80
+        send(FUN_ID, b"\x02\x3E\x80\x55\x55\x55\x55\x55")
+
+        # CAPL: driverData() 后 testWaitForTimeout(1000)
         time.sleep(1.0)
 
         # ===== 13. 31 DD02 =====
         sig = parse_rsa_text(RSA_DRIVER)
 
         print("sig len =", len(sig))
-        print("sig =", hx(sig))  # 👈 必须有！！！
+        print("sig head =", hx(sig[:16]))
+        print("sig tail =", hx(sig[-16:]))
 
         assert len(sig) == 512, f"RSA len error: {len(sig)}"
-        payload = b"\x31\x01\xDD\x02" + sig
+        payload = (
+                b"\x31\x01\xDD\x02"
+                + sig
+        )
+
         print("payload len =", len(payload))
 
         send_uds(payload)
