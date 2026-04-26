@@ -130,7 +130,9 @@ def send(arbid: int, data: bytes):
     if sid == 0x36 or pci == 0x2:
         return
 
-    print(f"[TX] 0x{arbid:03X}: {hx(data)}")
+    DEBUG_CAN = False
+    if DEBUG_CAN:
+        print(f"[TX] 0x{arbid:03X}: {hx(data)}")
 
 def recv(timeout: float = 2.0):
     end = time.time() + timeout
@@ -142,7 +144,7 @@ def recv(timeout: float = 2.0):
             continue
 
         data = bytes(m.data)
-        print(f"[RX] 0x{m.arbitration_id:03X}: {hx(data)}")
+        # print(f"[RX] 0x{m.arbitration_id:03X}: {hx(data)}")
         return data
 
     return None
@@ -223,7 +225,7 @@ def send_uds(payload: bytes, functional: bool = False, pad: int = PAD):
         if msg is None:
             continue
 
-        print("[RX for FC]", hx(msg))   # 🔥调试用
+        # print("[RX for FC]", hx(msg))   # 🔥调试用
 
         # 只认 FC（0x30）
         if msg[0] == 0x30:
@@ -233,7 +235,7 @@ def send_uds(payload: bytes, functional: bool = False, pad: int = PAD):
     if fc is None:
         raise TimeoutError("No FlowControl after FF")
 
-    print("[FC OK]", hx(fc))
+    # print("[FC OK]", hx(fc))
 
     # ---------- Consecutive Frames ----------
     pos = 6
@@ -266,8 +268,7 @@ def recv_uds_payload(timeout: float = 5.0):
 
         print(f"[ISO-TP RX] FF total_len={total_len}, already={len(buf)}")
 
-        fc = b"\x30\x00\x00\xAA\xAA\xAA\xAA\xAA"
-
+        fc = b"\x30\x00\x00\x00\x00\x00\x00\x00"
         print("[FC] send:", hx(fc))
         send(PHY_ID, fc)
 
@@ -453,12 +454,8 @@ def run():
     )
 
     try:
-        ka.start()
-        time.sleep(PRE_WAKEUP_TIME)
 
-        print("==== START CAPL DRIVER DOWNLOAD MIN ====")
         print("BUS_KWARGS =", BUS_KWARGS)
-
 
         time.sleep(0.2)
         drain_bus(0.5)
@@ -648,20 +645,16 @@ def run():
             send_uds(req)
 
             try:
-                resp36 = wait_sid(sid=0x36, timeout=10)
+                resp36 = wait_sid(sid=0x36, timeout=5.0)
                 if seq == 1 or seq == total_blocks_app or seq % 50 == 0:
                     print(f"[OK] 36 APP seq=0x{seq & 0xFF:02X} resp={hx(resp36)}")
             except Exception as e:
                 print(f"[FAIL] 36 APP seq=0x{seq & 0xFF:02X} pos={pos} chunk_len={len(chunk)}")
-
-                print(f"[FAIL] req_len={len(req)} seq=0x{seq & 0xFF:02X} pos={pos}")
-                print("fail req head =", hx(req[:32]))
-
                 print("fail chunk head =", hx(chunk[:32]))
                 print("fail chunk tail =", hx(chunk[-32:]))
-
                 raise
-            time.sleep(0.08)
+
+            time.sleep(0.05)
             pos += len(chunk)
             seq = (seq + 1) & 0xFF
 
