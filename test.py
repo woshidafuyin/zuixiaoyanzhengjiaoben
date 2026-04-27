@@ -71,7 +71,21 @@ DRIVER_LEN = 0x00001EB8
 
 def hx(data: bytes) -> str:
     return " ".join(f"{x:02X}" for x in data)
+def step(name):
+    print(f"\n[STEP] {name}")
 
+def ok(name, resp=None):
+    if resp is None:
+        print(f"[OK] {name}")
+    else:
+        print(f"[OK] {name}: {hx(resp)}")
+
+def progress(name, current, total, last_percent):
+    percent = int(current * 100 / total)
+    if percent != last_percent and percent % 10 == 0:
+        print(f"[PROGRESS] {name} {percent}%")
+        return percent
+    return last_percent
 
 class PeriodicSender:
     def __init__(self, bus, arb_id, payload, period_s, name=""):
@@ -272,7 +286,7 @@ def recv_uds_payload(timeout: float = 5.0):
         print("[FC] send:", hx(fc))
         send(PHY_ID, fc)
 
-        time.sleep(0.02)
+
 
         end = time.time() + timeout
 
@@ -280,7 +294,6 @@ def recv_uds_payload(timeout: float = 5.0):
             if time.time() > end:
                 print(f"[WARN] CF timeout, got {len(buf)}/{total_len}, use partial data")
                 return bytes(buf)
-
             cf = recv(timeout=0.1)
 
             if cf is None:
@@ -387,7 +400,7 @@ def s19_to_bin(path: str, start: int, length: int) -> bytes:
             f"start=0x{start:08X}, length=0x{length:08X}, file={path}"
         )
 
-    print(f"[S19] file={path}")
+
     print(f"[S19] start=0x{start:08X} length=0x{length:08X}")
     print(f"[S19] valid_records={valid_records} loaded_bytes={loaded_bytes}")
     print("[S19] head =", hx(bytes(buf[:32])))
@@ -423,11 +436,9 @@ def keygen(seed: bytes) -> bytes:
     except subprocess.CalledProcessError as e:
         out = e.output.decode(errors="ignore")
         print("[KEYGEN RAW - FAILED]")
-        print(out)
+
         raise
 
-    print("[KEYGEN RAW]")
-    print(out)
 
     m = re.search(r"KEY_HEX\s*=\s*([0-9a-fA-F]+)", out)
     if not m:
@@ -457,9 +468,9 @@ def run():
 
         print("BUS_KWARGS =", BUS_KWARGS)
 
-        time.sleep(0.2)
+        ka.start()
+        time.sleep(PRE_WAKEUP_TIME)
         drain_bus(0.5)
-
         # ===== 1. 10 83 =====
         send(FUN_ID, b"\x02\x10\x83\x55\x55\x55\x55\x55")
         time.sleep(0.05)
@@ -483,11 +494,11 @@ def run():
         send(PHY_ID, b"\x02\x27\x11\xFF\xFF\xFF\xFF\xFF")
 
         seed_resp = recv_uds_payload(timeout=5.0)
-        if seed_resp is None or len(seed_resp) < 6:
+        if seed_resp is None or len(seed_resp) < 18:
             print("[WARN] incomplete seed response:", seed_resp)
             return
 
-        print("[UDS] 27 11 payload =", hx(seed_resp))
+
 
         if seed_resp[0] != 0x67 or seed_resp[1] != 0x11:
             raise RuntimeError(f"Unexpected 27 seed response: {hx(seed_resp)}")
@@ -633,11 +644,11 @@ def run():
 
         pos = 0
         seq = 1
+        last_percent = -1
+
 
         while pos < len(app_data):
-            if seq == 1 or seq == total_blocks_app or seq % 50 == 0:
-                print(f"[36 APP] block={seq}/{total_blocks_app} pos={pos}")
-
+            last_percent = progress("APP 36", pos, len(app_data), last_percent)
             chunk = app_data[pos:pos + chunk_size_app]
 
             req = bytes([0x36, seq & 0xFF]) + chunk
@@ -646,15 +657,14 @@ def run():
 
             try:
                 resp36 = wait_sid(sid=0x36, timeout=5.0)
-                if seq == 1 or seq == total_blocks_app or seq % 50 == 0:
-                    print(f"[OK] 36 APP seq=0x{seq & 0xFF:02X} resp={hx(resp36)}")
+
             except Exception as e:
                 print(f"[FAIL] 36 APP seq=0x{seq & 0xFF:02X} pos={pos} chunk_len={len(chunk)}")
                 print("fail chunk head =", hx(chunk[:32]))
                 print("fail chunk tail =", hx(chunk[-32:]))
                 raise
 
-            time.sleep(0.05)
+
             pos += len(chunk)
             seq = (seq + 1) & 0xFF
 
